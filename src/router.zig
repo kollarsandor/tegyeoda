@@ -1,3 +1,4 @@
+```zig
 const std = @import("std");
 const common = @import("types/common.zig");
 const app_state = @import("app_state.zig");
@@ -305,7 +306,7 @@ fn routeTeam(
     const method = req.method;
 
     if (std.mem.eql(u8, path, "/v1/team")) {
-        if (std.mem.eql(u8, method, "GET")) return websets_handler.getTeamInfo(req, auth, state, allocator);
+        if (std.mem.eql(u8, method, "GET")) return team_handler.getTeamInfo(req, auth, state, allocator);
         return methodNotAllowedJson(allocator, "GET");
     }
 
@@ -505,8 +506,8 @@ fn routeWebset(
     }
 
     if (std.mem.eql(u8, sub, "/monitors")) {
-        if (std.mem.eql(u8, method, "GET")) return websets_handler.listWebsetMonitors(req, auth, state, allocator);
-        if (std.mem.eql(u8, method, "POST")) return websets_handler.createWebsetMonitor(req, auth, state, allocator);
+        if (std.mem.eql(u8, method, "GET")) return websets_handler.listWebsetMonitors(req, auth, state, webset_id, allocator);
+        if (std.mem.eql(u8, method, "POST")) return websets_handler.createWebsetMonitor(req, auth, state, webset_id, allocator);
         return methodNotAllowedJson(allocator, "GET, POST");
     }
 
@@ -519,21 +520,21 @@ fn routeWebset(
         if (!isSinglePathSegment(monitor_id)) return notFoundJson(allocator, false);
 
         if (monitor_sub.len == 0) {
-            if (std.mem.eql(u8, method, "GET")) return websets_handler.getWebsetMonitor(req, auth, state, monitor_id, allocator);
-            if (std.mem.eql(u8, method, "PATCH")) return websets_handler.updateWebsetMonitor(req, auth, state, monitor_id, allocator);
-            if (std.mem.eql(u8, method, "DELETE")) return websets_handler.deleteWebsetMonitor(req, auth, state, monitor_id, allocator);
+            if (std.mem.eql(u8, method, "GET")) return websets_handler.getWebsetMonitor(req, auth, state, webset_id, monitor_id, allocator);
+            if (std.mem.eql(u8, method, "PATCH")) return websets_handler.updateWebsetMonitor(req, auth, state, webset_id, monitor_id, allocator);
+            if (std.mem.eql(u8, method, "DELETE")) return websets_handler.deleteWebsetMonitor(req, auth, state, webset_id, monitor_id, allocator);
             return methodNotAllowedJson(allocator, "DELETE, GET, PATCH");
         }
 
         if (std.mem.eql(u8, monitor_sub, "/runs")) {
-            if (std.mem.eql(u8, method, "GET")) return websets_handler.listWebsetMonitorRuns(req, auth, state, monitor_id, allocator);
+            if (std.mem.eql(u8, method, "GET")) return websets_handler.listWebsetMonitorRuns(req, auth, state, webset_id, monitor_id, allocator);
             return methodNotAllowedJson(allocator, "GET");
         }
 
         if (std.mem.startsWith(u8, monitor_sub, "/runs/")) {
             const run_id = monitor_sub["/runs/".len..];
             if (!isSinglePathSegment(run_id)) return notFoundJson(allocator, false);
-            if (std.mem.eql(u8, method, "GET")) return websets_handler.getWebsetMonitorRun(req, auth, state, monitor_id, run_id, allocator);
+            if (std.mem.eql(u8, method, "GET")) return websets_handler.getWebsetMonitorRun(req, auth, state, webset_id, monitor_id, run_id, allocator);
             return methodNotAllowedJson(allocator, "GET");
         }
 
