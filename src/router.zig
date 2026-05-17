@@ -305,7 +305,7 @@ fn routeTeam(
     const method = req.method;
 
     if (std.mem.eql(u8, path, "/v1/team")) {
-        if (std.mem.eql(u8, method, "GET")) return team_handler.getTeamInfo(req, auth, state, allocator);
+        if (std.mem.eql(u8, method, "GET")) return websets_handler.getTeamInfo(req, auth, state, allocator);
         return methodNotAllowedJson(allocator, "GET");
     }
 
