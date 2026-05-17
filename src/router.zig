@@ -1,4 +1,3 @@
-```zig
 const std = @import("std");
 const common = @import("types/common.zig");
 const app_state = @import("app_state.zig");
