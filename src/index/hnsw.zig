@@ -6,12 +6,14 @@ pub const HnswIndex = struct {
     m: usize,
     ef_construction: usize,
     ef_search: usize,
-    nodes: std.ArrayList(HnswNode),
-    vectors: std.ArrayList([]f32),
+    enter_point: ?usize,
+    max_level: u32,
+    nodes: std.ArrayListUnmanaged(HnswNode),
+    vectors: std.ArrayListUnmanaged([]f32),
     mutex: std.Thread.RwLock,
     allocator: std.mem.Allocator,
     path: []const u8,
-    vector_norms: std.ArrayList(f32),
+    vector_norms: std.ArrayListUnmanaged(f32),
 
     pub const HnswNode = struct {
         id: []const u8,
@@ -23,6 +25,11 @@ pub const HnswIndex = struct {
     const FileVersion: u32 = 2;
     const max_id_len: usize = 4096;
 
+    const Scored = struct {
+        idx: usize,
+        score: f32,
+    };
+
     pub fn load(path: []const u8, dim: usize, allocator: std.mem.Allocator) !HnswIndex {
         const path_copy = try allocator.dupe(u8, path);
         errdefer allocator.free(path_copy);
@@ -32,12 +39,14 @@ pub const HnswIndex = struct {
             .m = 16,
             .ef_construction = 200,
             .ef_search = 50,
-            .nodes = try std.ArrayList(HnswNode).initCapacity(allocator, 0),
-            .vectors = try std.ArrayList([]f32).initCapacity(allocator, 0),
+            .enter_point = null,
+            .max_level = 0,
+            .nodes = .{},
+            .vectors = .{},
             .mutex = .{},
             .allocator = allocator,
             .path = path_copy,
-            .vector_norms = try std.ArrayList(f32).initCapacity(allocator, 0),
+            .vector_norms = .{},
         };
         errdefer idx.deinit();
 
@@ -47,49 +56,53 @@ pub const HnswIndex = struct {
         };
         defer file.close();
 
-        var read_buffer: [4096]u8 = undefined;
-        var file_reader = file.reader(&read_buffer);
-        const reader = &file_reader.interface;
-
-        const magic = try reader.takeInt(u32, .little);
+        const magic = try readIntLe(u32, file);
         if (magic != FileMagic) return error.InvalidFormat;
 
-        const version = try reader.takeInt(u32, .little);
+        const version = try readIntLe(u32, file);
         if (version != 1 and version != FileVersion) return error.UnsupportedVersion;
 
-        const count_u64 = try reader.takeInt(u64, .little);
-        const file_dim_u64 = try reader.takeInt(u64, .little);
-
+        const count_u64 = try readIntLe(u64, file);
+        const file_dim_u64 = try readIntLe(u64, file);
         if (file_dim_u64 != dim) return error.DimensionMismatch;
 
-        const count = try std.math.cast(usize, count_u64) orelse return error.Overflow;
+        const count = std.math.cast(usize, count_u64) orelse return error.Overflow;
 
         try idx.nodes.ensureTotalCapacity(allocator, count);
         try idx.vectors.ensureTotalCapacity(allocator, count);
         try idx.vector_norms.ensureTotalCapacity(allocator, count);
 
         if (version >= 2) {
-            idx.m = try readBoundedUsize(reader, 1, 1024);
-            idx.ef_construction = try readBoundedUsize(reader, 1, 1_000_000);
-            idx.ef_search = try readBoundedUsize(reader, 1, 1_000_000);
+            idx.m = try readBoundedUsize(file, 1, 1024);
+            idx.ef_construction = try readBoundedUsize(file, 1, 1_000_000);
+            idx.ef_search = try readBoundedUsize(file, 1, 1_000_000);
         }
+
+        var max_level: u32 = 0;
+        var enter_point: ?usize = null;
 
         var ci: usize = 0;
         while (ci < count) : (ci += 1) {
-            const id_len_u32 = try reader.takeInt(u32, .little);
-            const id_len = @as(usize, @intCast(id_len_u32));
+            const id_len_u32 = try readIntLe(u32, file);
+            const id_len = std.math.cast(usize, id_len_u32) orelse return error.Overflow;
             if (id_len == 0 or id_len > max_id_len) return error.InvalidIdentifierLength;
 
             const id_buf = try allocator.alloc(u8, id_len);
-            errdefer allocator.free(id_buf);
-            try reader.readSliceAll(id_buf);
+            var id_owned = true;
+            errdefer {
+                if (id_owned) allocator.free(id_buf);
+            }
+            try readExact(file, id_buf);
 
             const vec = try allocator.alloc(f32, dim);
-            errdefer allocator.free(vec);
+            var vec_owned = true;
+            errdefer {
+                if (vec_owned) allocator.free(vec);
+            }
 
             var norm_sq: f32 = 0;
             for (vec) |*v| {
-                const bits = try reader.takeInt(u32, .little);
+                const bits = try readIntLe(u32, file);
                 const value: f32 = @bitCast(bits);
                 if (!std.math.isFinite(value)) return error.InvalidVectorValue;
                 v.* = value;
@@ -97,38 +110,44 @@ pub const HnswIndex = struct {
             }
 
             var node_level: u32 = 0;
-            var neighbors: [][]u32 = &.{};
+            var neighbors = try allocator.alloc([]u32, 0);
+            var neighbors_owned = true;
+            var allocated_layers: usize = 0;
+            errdefer {
+                if (neighbors_owned) {
+                    for (neighbors[0..allocated_layers]) |layer| {
+                        allocator.free(layer);
+                    }
+                    allocator.free(neighbors);
+                }
+            }
 
             if (version >= 2) {
-                node_level = try reader.takeInt(u32, .little);
-                const layer_count_u32 = try reader.takeInt(u32, .little);
-                const layer_count = @as(usize, @intCast(layer_count_u32));
+                node_level = try readIntLe(u32, file);
+                const layer_count_u32 = try readIntLe(u32, file);
+                const layer_count = std.math.cast(usize, layer_count_u32) orelse return error.Overflow;
                 if (layer_count == 0) {
                     if (node_level != 0) return error.InvalidLevelData;
-                    neighbors = &.{};
                 } else {
-                    if (layer_count != @as(usize, @intCast(node_level)) + 1) return error.InvalidLevelData;
+                    const expected_layers = (std.math.cast(usize, node_level) orelse return error.Overflow) + 1;
+                    if (layer_count != expected_layers) return error.InvalidLevelData;
 
+                    allocator.free(neighbors);
                     neighbors = try allocator.alloc([]u32, layer_count);
-                    errdefer {
-                        for (neighbors) |layer| {
-                            allocator.free(layer);
-                        }
-                        allocator.free(neighbors);
-                    }
+                    allocated_layers = 0;
 
                     for (0..layer_count) |layer_idx| {
-                        const neighbor_count_u32 = try reader.takeInt(u32, .little);
-                        const neighbor_count = @as(usize, @intCast(neighbor_count_u32));
-                        if (neighbor_count > idx.m) return error.InvalidNeighborCount;
+                        const neighbor_count_u32 = try readIntLe(u32, file);
+                        const neighbor_count = std.math.cast(usize, neighbor_count_u32) orelse return error.Overflow;
+                        if (neighbor_count > idx.m * 2) return error.InvalidNeighborCount;
 
                         const layer = try allocator.alloc(u32, neighbor_count);
                         neighbors[layer_idx] = layer;
+                        allocated_layers = layer_idx + 1;
 
-                        for (layer, 0..) |*dst, ni| {
-                            _ = ni;
-                            const neighbor_idx_u32 = try reader.takeInt(u32, .little);
-                            const neighbor_idx = @as(usize, @intCast(neighbor_idx_u32));
+                        for (layer) |*dst| {
+                            const neighbor_idx_u32 = try readIntLe(u32, file);
+                            const neighbor_idx = std.math.cast(usize, neighbor_idx_u32) orelse return error.Overflow;
                             if (neighbor_idx >= count) return error.InvalidNeighborIndex;
                             dst.* = neighbor_idx_u32;
                         }
@@ -136,16 +155,66 @@ pub const HnswIndex = struct {
                 }
             }
 
-            const norm = if (norm_sq > 0) @sqrt(norm_sq) else 0;
+            const norm = if (norm_sq > 0) @sqrt(norm_sq) else @as(f32, 0);
+
+            try idx.vectors.append(allocator, vec);
+            var vec_in_list = true;
+            errdefer {
+                if (vec_in_list) {
+                    _ = idx.vectors.pop();
+                    allocator.free(vec);
+                    vec_owned = false;
+                    vec_in_list = false;
+                }
+            }
+
+            try idx.vector_norms.append(allocator, norm);
+            var norm_in_list = true;
+            errdefer {
+                if (norm_in_list) {
+                    _ = idx.vector_norms.pop();
+                    norm_in_list = false;
+                }
+            }
 
             try idx.nodes.append(allocator, .{
                 .id = id_buf,
                 .level = node_level,
                 .neighbors = neighbors,
             });
-            try idx.vectors.append(allocator, vec);
-            try idx.vector_norms.append(allocator, norm);
+            errdefer {
+                _ = idx.nodes.pop();
+                if (id_owned) {
+                    allocator.free(id_buf);
+                    id_owned = false;
+                }
+                if (vec_in_list) {
+                    _ = idx.vectors.pop();
+                    allocator.free(vec);
+                    vec_owned = false;
+                    vec_in_list = false;
+                }
+                if (norm_in_list) {
+                    _ = idx.vector_norms.pop();
+                    norm_in_list = false;
+                }
+                if (neighbors_owned) {
+                    for (neighbors[0..allocated_layers]) |layer| {
+                        allocator.free(layer);
+                    }
+                    allocator.free(neighbors);
+                    neighbors_owned = false;
+                }
+            }
+
+            if (enter_point == null or node_level > max_level) {
+                max_level = node_level;
+                enter_point = ci;
+            }
         }
+
+        idx.max_level = max_level;
+        idx.enter_point = enter_point;
 
         return idx;
     }
@@ -161,9 +230,7 @@ pub const HnswIndex = struct {
             for (node.neighbors) |layer| {
                 self.allocator.free(layer);
             }
-            if (node.neighbors.len > 0) {
-                self.allocator.free(node.neighbors);
-            }
+            self.allocator.free(node.neighbors);
         }
         self.nodes.deinit(self.allocator);
 
@@ -181,59 +248,54 @@ pub const HnswIndex = struct {
             }
         }
 
-        var tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{path});
         defer self.allocator.free(tmp_path);
 
         {
-            const file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .read = false });
+            const file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
             defer file.close();
-
-            var write_buffer: [4096]u8 = undefined;
-            var file_writer = file.writer(&write_buffer);
-            const writer = &file_writer.interface;
 
             if (self.nodes.items.len != self.vectors.items.len or self.nodes.items.len != self.vector_norms.items.len) {
                 return error.CorruptIndexState;
             }
 
-            try writer.writeInt(u32, FileMagic, .little);
-            try writer.writeInt(u32, FileVersion, .little);
-            try writer.writeInt(u64, @intCast(self.nodes.items.len), .little);
-            try writer.writeInt(u64, @intCast(self.dim), .little);
-            try writer.writeInt(u64, @intCast(self.m), .little);
-            try writer.writeInt(u64, @intCast(self.ef_construction), .little);
-            try writer.writeInt(u64, @intCast(self.ef_search), .little);
+            try writeIntLe(u32, file, FileMagic);
+            try writeIntLe(u32, file, FileVersion);
+            try writeIntLe(u64, file, @as(u64, @intCast(self.nodes.items.len)));
+            try writeIntLe(u64, file, @as(u64, @intCast(self.dim)));
+            try writeIntLe(u64, file, @as(u64, @intCast(self.m)));
+            try writeIntLe(u64, file, @as(u64, @intCast(self.ef_construction)));
+            try writeIntLe(u64, file, @as(u64, @intCast(self.ef_search)));
 
             for (self.nodes.items, 0..) |node, i| {
                 const vec = self.vectors.items[i];
                 if (vec.len != self.dim) return error.CorruptIndexState;
                 if (node.id.len == 0 or node.id.len > max_id_len) return error.CorruptIndexState;
                 if (node.neighbors.len == 0 and node.level != 0) return error.CorruptIndexState;
-                if (node.neighbors.len > 0 and node.neighbors.len != @as(usize, @intCast(node.level)) + 1) return error.CorruptIndexState;
+                if (node.neighbors.len > 0 and node.neighbors.len != (std.math.cast(usize, node.level) orelse return error.CorruptIndexState) + 1) return error.CorruptIndexState;
 
-                try writer.writeInt(u32, @intCast(node.id.len), .little);
-                try writer.writeAll(node.id);
+                try writeIntLe(u32, file, @as(u32, @intCast(node.id.len)));
+                try file.writeAll(node.id);
 
                 for (vec) |v| {
                     if (!std.math.isFinite(v)) return error.InvalidVectorValue;
                     const bits: u32 = @bitCast(v);
-                    try writer.writeInt(u32, bits, .little);
+                    try writeIntLe(u32, file, bits);
                 }
 
-                try writer.writeInt(u32, node.level, .little);
-                try writer.writeInt(u32, @intCast(node.neighbors.len), .little);
+                try writeIntLe(u32, file, node.level);
+                try writeIntLe(u32, file, @as(u32, @intCast(node.neighbors.len)));
 
                 for (node.neighbors) |layer| {
-                    if (layer.len > self.m) return error.CorruptIndexState;
-                    try writer.writeInt(u32, @intCast(layer.len), .little);
+                    if (layer.len > self.m * 2) return error.CorruptIndexState;
+                    try writeIntLe(u32, file, @as(u32, @intCast(layer.len)));
                     for (layer) |neighbor_idx| {
-                        if (@as(usize, @intCast(neighbor_idx)) >= self.nodes.items.len) return error.CorruptIndexState;
-                        try writer.writeInt(u32, neighbor_idx, .little);
+                        if (neighbor_idx >= self.nodes.items.len) return error.CorruptIndexState;
+                        try writeIntLe(u32, file, neighbor_idx);
                     }
                 }
             }
 
-            try writer.flush();
             try file.sync();
         }
 
@@ -262,27 +324,91 @@ pub const HnswIndex = struct {
             if (!std.math.isFinite(v)) return error.InvalidVectorValue;
             norm_sq += v * v;
         }
-        const norm = if (norm_sq > 0) @sqrt(norm_sq) else 0;
+        const norm = if (norm_sq > 0) @sqrt(norm_sq) else @as(f32, 0);
 
         const id_copy = try self.allocator.dupe(u8, id);
         errdefer self.allocator.free(id_copy);
 
+        const level = self.randomLevel(id, vec_copy);
+        const layer_count = level + 1;
+        var neighbors = try self.allocator.alloc([]u32, layer_count);
+        errdefer self.allocator.free(neighbors);
+        for (0..layer_count) |i| {
+            neighbors[i] = &.{};
+        }
+
+        const new_idx = self.nodes.items.len;
+
         try self.vectors.append(self.allocator, vec_copy);
-        errdefer self.vectors.items.len -= 1;
+        errdefer _ = self.vectors.pop();
 
         try self.vector_norms.append(self.allocator, norm);
-        errdefer self.vector_norms.items.len -= 1;
+        errdefer _ = self.vector_norms.pop();
 
-        const node = HnswNode{
+        try self.nodes.append(self.allocator, .{
             .id = id_copy,
-            .level = 0,
-            .neighbors = &.{},
-        };
+            .level = level,
+            .neighbors = neighbors,
+        });
+        errdefer _ = self.nodes.pop();
 
-        try self.nodes.append(self.allocator, node);
-        errdefer {
-            self.nodes.items.len -= 1;
-            self.allocator.free(id_copy);
+        if (self.enter_point == null) {
+            self.enter_point = new_idx;
+            self.max_level = level;
+            return;
+        }
+
+        var curr_node = self.enter_point.?;
+        var curr_score = cosineSimilarityWithNorm(vec_copy, norm, self.vectors.items[curr_node], self.vector_norms.items[curr_node]);
+        var curr_level = self.max_level;
+
+        while (curr_level > level) {
+            var changed = true;
+            while (changed) {
+                changed = false;
+                const node_neighbors = self.nodes.items[curr_node].neighbors[curr_level];
+                for (node_neighbors) |neighbor_u32| {
+                    const neighbor = @as(usize, neighbor_u32);
+                    const score = cosineSimilarityWithNorm(vec_copy, norm, self.vectors.items[neighbor], self.vector_norms.items[neighbor]);
+                    if (score > curr_score) {
+                        curr_score = score;
+                        curr_node = neighbor;
+                        changed = true;
+                    }
+                }
+            }
+            if (curr_level == 0) break;
+            curr_level -= 1;
+        }
+
+        curr_level = @min(self.max_level, level);
+        while (true) {
+            const top_candidates = try self.searchLayerBase(vec_copy, norm, curr_node, self.ef_construction, curr_level, self.allocator);
+            defer self.allocator.free(top_candidates);
+
+            const m_count = @min(top_candidates.len, self.m);
+            var new_neighbors = try self.allocator.alloc(u32, m_count);
+            for (0..m_count) |i| {
+                new_neighbors[i] = @intCast(top_candidates[i].idx);
+            }
+            self.nodes.items[new_idx].neighbors[curr_level] = new_neighbors;
+
+            for (new_neighbors) |neighbor_u32| {
+                const neighbor = @as(usize, neighbor_u32);
+                try self.addLink(neighbor, new_idx, curr_level, vec_copy, norm);
+            }
+
+            if (top_candidates.len > 0) {
+                curr_node = top_candidates[0].idx;
+            }
+
+            if (curr_level == 0) break;
+            curr_level -= 1;
+        }
+
+        if (level > self.max_level) {
+            self.max_level = level;
+            self.enter_point = new_idx;
         }
     }
 
@@ -293,82 +419,198 @@ pub const HnswIndex = struct {
         self.mutex.lockShared();
         defer self.mutex.unlockShared();
 
-        if (self.vectors.items.len == 0) {
+        if (self.enter_point == null) {
             return try allocator.alloc(common.SearchHit, 0);
         }
-
-        if (self.nodes.items.len != self.vectors.items.len or self.nodes.items.len != self.vector_norms.items.len) {
-            return error.CorruptIndexState;
-        }
-
-        const result_count = @min(k, self.vectors.items.len);
-
-        const Scored = struct {
-            idx: usize,
-            score: f32,
-        };
 
         var query_norm_sq: f32 = 0;
         for (query_vec) |v| {
             if (!std.math.isFinite(v)) return error.InvalidVectorValue;
             query_norm_sq += v * v;
         }
-        const query_norm = if (query_norm_sq > 0) @sqrt(query_norm_sq) else 0;
+        const query_norm = if (query_norm_sq > 0) @sqrt(query_norm_sq) else @as(f32, 0);
 
-        var top = try allocator.alloc(Scored, result_count);
-        defer allocator.free(top);
+        var curr_node = self.enter_point.?;
+        var curr_score = cosineSimilarityWithNorm(query_vec, query_norm, self.vectors.items[curr_node], self.vector_norms.items[curr_node]);
 
-        var top_len: usize = 0;
-
-        for (self.vectors.items, 0..) |vec, idx| {
-            const score = cosineSimilarityWithNorm(query_vec, query_norm, vec, self.vector_norms.items[idx]);
-
-            if (top_len < result_count) {
-                top[top_len] = .{ .idx = idx, .score = score };
-                top_len += 1;
-
-                var pos = top_len - 1;
-                while (pos > 0 and scoredGreater(top[pos], top[pos - 1])) : (pos -= 1) {
-                    std.mem.swap(Scored, &top[pos], &top[pos - 1]);
-                }
-            } else if (scoredGreater(.{ .idx = idx, .score = score }, top[top_len - 1])) {
-                top[top_len - 1] = .{ .idx = idx, .score = score };
-
-                var pos = top_len - 1;
-                while (pos > 0 and scoredGreater(top[pos], top[pos - 1])) : (pos -= 1) {
-                    std.mem.swap(Scored, &top[pos], &top[pos - 1]);
+        var curr_level = self.max_level;
+        while (curr_level > 0) {
+            var changed = true;
+            while (changed) {
+                changed = false;
+                const neighbors = self.nodes.items[curr_node].neighbors[curr_level];
+                for (neighbors) |neighbor_u32| {
+                    const neighbor = @as(usize, neighbor_u32);
+                    const score = cosineSimilarityWithNorm(query_vec, query_norm, self.vectors.items[neighbor], self.vector_norms.items[neighbor]);
+                    if (score > curr_score) {
+                        curr_score = score;
+                        curr_node = neighbor;
+                        changed = true;
+                    }
                 }
             }
+            curr_level -= 1;
         }
 
-        var hits = try allocator.alloc(common.SearchHit, top_len);
-        errdefer allocator.free(hits);
+        const top_candidates = try self.searchLayerBase(query_vec, query_norm, curr_node, @max(self.ef_search, k), 0, allocator);
+        defer allocator.free(top_candidates);
 
-        for (0..top_len) |i| {
-            const idx = top[i].idx;
-            hits[i] = common.SearchHit{
-                .id = self.nodes.items[idx].id,
-                .score = top[i].score,
+        const result_count = @min(k, top_candidates.len);
+        var hits = try allocator.alloc(common.SearchHit, result_count);
+        for (0..result_count) |i| {
+            hits[i] = .{
+                .id = self.nodes.items[top_candidates[i].idx].id,
+                .score = top_candidates[i].score,
             };
         }
 
         return hits;
     }
 
-    fn readBoundedUsize(reader: anytype, min: usize, max: usize) !usize {
-        const value_u64 = try reader.takeInt(u64, .little);
-        const value = try std.math.cast(usize, value_u64) orelse return error.Overflow;
+    fn searchLayerBase(self: *HnswIndex, query_vec: []const f32, query_norm: f32, ep: usize, ef: usize, layer: usize, allocator: std.mem.Allocator) ![]Scored {
+        var visited = std.AutoHashMap(usize, void).init(allocator);
+        defer visited.deinit();
+        try visited.put(ep, {});
+
+        var candidates = try std.ArrayList(Scored).initCapacity(allocator, ef);
+        defer candidates.deinit();
+
+        var top_results = try std.ArrayList(Scored).initCapacity(allocator, ef);
+        defer top_results.deinit();
+
+        const ep_score = cosineSimilarityWithNorm(query_vec, query_norm, self.vectors.items[ep], self.vector_norms.items[ep]);
+        candidates.appendAssumeCapacity(.{ .idx = ep, .score = ep_score });
+        top_results.appendAssumeCapacity(.{ .idx = ep, .score = ep_score });
+
+        while (candidates.items.len > 0) {
+            var best_cand_idx: usize = 0;
+            var best_cand_score = candidates.items[0].score;
+            for (candidates.items[1..], 1..) |cand, i| {
+                if (cand.score > best_cand_score) {
+                    best_cand_score = cand.score;
+                    best_cand_idx = i;
+                }
+            }
+            const c = candidates.swapRemove(best_cand_idx);
+
+            const worst_res_score = top_results.items[top_results.items.len - 1].score;
+            if (c.score < worst_res_score and top_results.items.len >= ef) {
+                break;
+            }
+
+            const node_neighbors = self.nodes.items[c.idx].neighbors[layer];
+            for (node_neighbors) |neighbor_u32| {
+                const neighbor = @as(usize, neighbor_u32);
+                if (!visited.contains(neighbor)) {
+                    try visited.put(neighbor, {});
+                    const score = cosineSimilarityWithNorm(query_vec, query_norm, self.vectors.items[neighbor], self.vector_norms.items[neighbor]);
+
+                    const current_worst = top_results.items[top_results.items.len - 1].score;
+                    if (top_results.items.len < ef or score > current_worst) {
+                        try candidates.append(.{ .idx = neighbor, .score = score });
+                        try insertSorted(&top_results, .{ .idx = neighbor, .score = score }, ef);
+                    }
+                }
+            }
+        }
+
+        return top_results.toOwnedSlice();
+    }
+
+    fn addLink(self: *HnswIndex, target: usize, new_node: usize, layer: usize, new_vec: []const f32, new_norm: f32) !void {
+        const neighbors = self.nodes.items[target].neighbors[layer];
+        const max_m = if (layer == 0) self.m * 2 else self.m;
+
+        for (neighbors) |n| {
+            if (n == new_node) return;
+        }
+
+        if (neighbors.len < max_m) {
+            var new_neighbors = try self.allocator.alloc(u32, neighbors.len + 1);
+            @memcpy(new_neighbors[0..neighbors.len], neighbors);
+            new_neighbors[neighbors.len] = @intCast(new_node);
+            self.allocator.free(neighbors);
+            self.nodes.items[target].neighbors[layer] = new_neighbors;
+        } else {
+            var candidates = try self.allocator.alloc(Scored, neighbors.len + 1);
+            defer self.allocator.free(candidates);
+
+            for (neighbors, 0..) |n, i| {
+                candidates[i] = .{
+                    .idx = n,
+                    .score = cosineSimilarityWithNorm(self.vectors.items[target], self.vector_norms.items[target], self.vectors.items[n], self.vector_norms.items[n]),
+                };
+            }
+            candidates[neighbors.len] = .{
+                .idx = new_node,
+                .score = cosineSimilarityWithNorm(self.vectors.items[target], self.vector_norms.items[target], new_vec, new_norm),
+            };
+
+            sortScoredDesc(candidates);
+
+            var new_neighbors = try self.allocator.alloc(u32, max_m);
+            for (0..max_m) |i| {
+                new_neighbors[i] = @intCast(candidates[i].idx);
+            }
+            self.allocator.free(neighbors);
+            self.nodes.items[target].neighbors[layer] = new_neighbors;
+        }
+    }
+
+    fn randomLevel(self: *const HnswIndex, id: []const u8, vec: []const f32) u32 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(id);
+        var len_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_bytes, @intCast(self.nodes.items.len), .little);
+        hasher.update(&len_bytes);
+        if (vec.len > 0) {
+            var first_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &first_bytes, @bitCast(vec[0]), .little);
+            hasher.update(&first_bytes);
+        }
+        var state = hasher.final();
+        const divisor = @max(self.m, 2);
+        var level: u32 = 0;
+        const max_level: u32 = 32;
+        while (level < max_level) {
+            state = state *% 2862933555777941757 +% 3037000493;
+            if (state % @as(u64, @intCast(divisor)) != 0) break;
+            level += 1;
+        }
+        return level;
+    }
+
+    fn readBoundedUsize(file: std.fs.File, min: usize, max: usize) !usize {
+        const value_u64 = try readIntLe(u64, file);
+        const value = std.math.cast(usize, value_u64) orelse return error.Overflow;
         if (value < min or value > max) return error.InvalidParameter;
         return value;
     }
-
-    fn scoredGreater(a: anytype, b: anytype) bool {
-        if (std.math.isNan(a.score)) return false;
-        if (std.math.isNan(b.score)) return true;
-        if (a.score == b.score) return a.idx < b.idx;
-        return a.score > b.score;
-    }
 };
+
+fn insertSorted(list: *std.ArrayList(HnswIndex.Scored), item: HnswIndex.Scored, max_len: usize) !void {
+    var insert_idx: usize = list.items.len;
+    for (list.items, 0..) |existing, i| {
+        if (item.score > existing.score) {
+            insert_idx = i;
+            break;
+        }
+    }
+    try list.insert(insert_idx, item);
+    if (list.items.len > max_len) {
+        _ = list.pop();
+    }
+}
+
+fn sortScoredDesc(items: []HnswIndex.Scored) void {
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        var j = i;
+        while (j > 0 and items[j].score > items[j - 1].score) : (j -= 1) {
+            std.mem.swap(HnswIndex.Scored, &items[j], &items[j - 1]);
+        }
+    }
+}
 
 pub fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
     if (a.len != b.len) return 0;
@@ -378,7 +620,7 @@ pub fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
         if (!std.math.isFinite(v)) return 0;
         norm_b_sq += v * v;
     }
-    const norm_b = if (norm_b_sq > 0) @sqrt(norm_b_sq) else 0;
+    const norm_b = if (norm_b_sq > 0) @sqrt(norm_b_sq) else @as(f32, 0);
     return cosineSimilarityWithNorm(a, null, b, norm_b);
 }
 
@@ -389,38 +631,41 @@ fn cosineSimilarityWithNorm(a: []const f32, a_norm_opt: ?f32, b: []const f32, b_
     var dot_product: f32 = 0;
     var norm_a_sq: f32 = 0;
 
-    const vector_width: usize = 8;
-
-    var i: usize = 0;
-    while (i + vector_width <= a.len) : (i += vector_width) {
-        const va: @Vector(vector_width, f32) = a[i..][0..vector_width].*;
-        const vb: @Vector(vector_width, f32) = b[i..][0..vector_width].*;
-
-        inline for (0..vector_width) |lane| {
-            if (!std.math.isFinite(va[lane]) or !std.math.isFinite(vb[lane])) return 0;
-        }
-
-        dot_product += @reduce(.Add, va * vb);
+    for (a, b) |av, bv| {
+        if (!std.math.isFinite(av) or !std.math.isFinite(bv)) return 0;
+        dot_product += av * bv;
         if (a_norm_opt == null) {
-            norm_a_sq += @reduce(.Add, va * va);
+            norm_a_sq += av * av;
         }
     }
 
-    while (i < a.len) : (i += 1) {
-        if (!std.math.isFinite(a[i]) or !std.math.isFinite(b[i])) return 0;
-        dot_product += a[i] * b[i];
-        if (a_norm_opt == null) {
-            norm_a_sq += a[i] * a[i];
-        }
-    }
-
-    const norm_a = if (a_norm_opt) |n| n else if (norm_a_sq > 0) @sqrt(norm_a_sq) else 0;
-
+    const norm_a = if (a_norm_opt) |n| n else if (norm_a_sq > 0) @sqrt(norm_a_sq) else @as(f32, 0);
     if (norm_a <= 0 or b_norm <= 0) return 0;
 
     const score = dot_product / (norm_a * b_norm);
     if (!std.math.isFinite(score)) return 0;
     return score;
+}
+
+fn readExact(file: std.fs.File, buf: []u8) !void {
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const n = try file.read(buf[offset..]);
+        if (n == 0) return error.UnexpectedEndOfFile;
+        offset += n;
+    }
+}
+
+fn readIntLe(comptime T: type, file: std.fs.File) !T {
+    var buf: [@sizeOf(T)]u8 = undefined;
+    try readExact(file, buf[0..]);
+    return std.mem.readInt(T, buf[0..], .little);
+}
+
+fn writeIntLe(comptime T: type, file: std.fs.File, value: T) !void {
+    var buf: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, buf[0..], value, .little);
+    try file.writeAll(buf[0..]);
 }
 
 test "cosine similarity" {
@@ -446,12 +691,14 @@ test "insert and search" {
         .m = 16,
         .ef_construction = 200,
         .ef_search = 50,
-        .nodes = try std.ArrayList(HnswIndex.HnswNode).initCapacity(allocator, 0),
-        .vectors = try std.ArrayList([]f32).initCapacity(allocator, 0),
+        .enter_point = null,
+        .max_level = 0,
+        .nodes = .{},
+        .vectors = .{},
         .mutex = .{},
         .allocator = allocator,
         .path = try allocator.dupe(u8, "test.hnsw"),
-        .vector_norms = try std.ArrayList(f32).initCapacity(allocator, 0),
+        .vector_norms = .{},
     };
     defer index.deinit();
 
@@ -480,12 +727,14 @@ test "save and load" {
             .m = 8,
             .ef_construction = 100,
             .ef_search = 25,
-            .nodes = try std.ArrayList(HnswIndex.HnswNode).initCapacity(allocator, 0),
-            .vectors = try std.ArrayList([]f32).initCapacity(allocator, 0),
+            .enter_point = null,
+            .max_level = 0,
+            .nodes = .{},
+            .vectors = .{},
             .mutex = .{},
             .allocator = allocator,
             .path = try allocator.dupe(u8, path),
-            .vector_norms = try std.ArrayList(f32).initCapacity(allocator, 0),
+            .vector_norms = .{},
         };
         defer index.deinit();
 
